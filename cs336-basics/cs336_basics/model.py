@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import warnings
+from contextlib import contextmanager
 
 import einx
 import torch
@@ -16,6 +17,18 @@ from torch import Tensor
 from cs336_basics.nn_utils import softmax
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def maybe_nvtx_range(name: str):
+    enabled = os.environ.get("CS336_DETAILED_ATTN_NVTX") == "1" and torch.cuda.is_available()
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
 
 
 class Linear(nn.Module):
@@ -441,14 +454,20 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
-    if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    with maybe_nvtx_range("attn/qk_matmul"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key")
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with maybe_nvtx_range("attn/scale_mask"):
+        attention_scores = attention_scores / math.sqrt(d_k)
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    with maybe_nvtx_range("attn/softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    with maybe_nvtx_range("attn/av_matmul"):
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
@@ -508,9 +527,10 @@ class CausalMultiHeadSelfAttention(nn.Module):
         *batch_dims, sequence_length, d_model = x.size()
         assert d_model == self.d_model
 
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+        with maybe_nvtx_range("attn/qkv_proj"):
+            Q = self.q_proj(x)
+            K = self.k_proj(x)
+            V = self.v_proj(x)
 
         # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
         Q, K, V = (
@@ -541,7 +561,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
         # Apply the output projection
-        output = self.output_proj(attn_output)
+        with maybe_nvtx_range("attn/out_proj"):
+            output = self.output_proj(attn_output)
         return output
 
 
