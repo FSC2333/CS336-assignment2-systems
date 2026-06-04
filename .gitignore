@@ -166,3 +166,4 @@ cython_debug/
 profiles
 memory_snapshots
 memory_residual_reports
+*.csv
