@@ -34,9 +34,10 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
-    query_tile_index = tl.program_id(0)
+    # batch 和 query 维度的 确定唯一一个 program instance，在二维网络中拿到自己的坐标
+    query_tile_index = tl.program_id(0) 
     batch_index = tl.program_id(1)
 
     Q_block_ptr = tl.make_block_ptr(
@@ -45,7 +46,7 @@ def flash_fwd_kernel(
         strides=(stride_qq, stride_qd),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
+        order=(1, 0), # 这是给 Triton 的内存访问顺序提示
     )
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_kb,
@@ -80,8 +81,8 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # boundary_check=(0, 1) 表示两个维度都做越界检查。越界的位置用 0 填充。
+    q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) # 计算当前 tile 中每个 query 的全局索引，用于后续的 causal mask 计算
 
     m_i = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
@@ -94,7 +95,7 @@ def flash_fwd_kernel(
 
         scores = tl.dot(q, tl.trans(k)) * scale
         scores = tl.where(k_offsets[None, :] < N_KEYS, scores, -float("inf"))
-        if IS_CAUSAL:
+        if is_causal:
             scores = tl.where(q_offsets[:, None] >= k_offsets[None, :], scores, -1.0e6)
 
         m_ij = tl.max(scores, axis=1)
@@ -178,12 +179,13 @@ class FlashAttentionTritonAutogradFunction(torch.autograd.Function):
             D=d,
             Q_TILE_SIZE=FlashAttentionTritonAutogradFunction.Q_TILE_SIZE,
             K_TILE_SIZE=FlashAttentionTritonAutogradFunction.K_TILE_SIZE,
-            IS_CAUSAL=bool(is_causal),
+            is_causal=bool(is_causal),
         )
 
         output = output.reshape(*batch_shape, n_queries, d)
         L = L.reshape(*batch_shape, n_queries).to(score_dtype)
         ctx.save_for_backward(L, Q, K, V, output)
+        ctx.is_causal = is_causal
         return output
 
     @staticmethod
@@ -260,6 +262,7 @@ class FlashAttentionPytorchAutogradFunction(torch.autograd.Function):
         output = o.reshape(*batch_shape, n_queries, d_v).to(out_dtype)
         L = lse.reshape(*batch_shape, n_queries).to(score_dtype)
         ctx.save_for_backward(L, Q, K, V, output)
+        ctx.is_causal = is_causal
         return output
 
     @staticmethod
