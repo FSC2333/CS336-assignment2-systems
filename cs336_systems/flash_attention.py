@@ -6,6 +6,8 @@ import triton
 import triton.language as tl
 import torch
 
+from cs336_systems.flash_attention_backward import flash_attention_backward_pytorch
+
 
 @triton.jit
 def flash_fwd_kernel(
@@ -37,8 +39,8 @@ def flash_fwd_kernel(
     is_causal: tl.constexpr,
 ):
     # batch 和 query 维度的 确定唯一一个 program instance，在二维网络中拿到自己的坐标
-    query_tile_index = tl.program_id(0) 
-    batch_index = tl.program_id(1)
+    query_tile_index = tl.program_id(1) 
+    batch_index = tl.program_id(0)
 
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_qb,
@@ -128,7 +130,7 @@ class FlashAttentionTritonAutogradFunction(torch.autograd.Function):
         if not Q.is_cuda or not K.is_cuda or not V.is_cuda:
             raise ValueError("FlashAttentionTritonAutogradFunction requires CUDA tensors")
 
-        batch_shape = Q.shape[:-2]
+        batch_shape = Q.shape[:-2] 
         n_queries = Q.shape[-2]
         n_keys = K.shape[-2]
         d = Q.shape[-1]
@@ -152,7 +154,7 @@ class FlashAttentionTritonAutogradFunction(torch.autograd.Function):
         output = torch.empty((batch_size, n_queries, d), dtype=out_dtype, device=Q.device)
         L = torch.empty((batch_size, n_queries), dtype=torch.float32, device=Q.device)
 
-        grid = (triton.cdiv(n_queries, FlashAttentionTritonAutogradFunction.Q_TILE_SIZE), batch_size)
+        grid = (batch_size, triton.cdiv(n_queries, FlashAttentionTritonAutogradFunction.Q_TILE_SIZE))
         flash_fwd_kernel[grid](
             q,
             k,
@@ -190,7 +192,9 @@ class FlashAttentionTritonAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError
+        L, Q, K, V, output = ctx.saved_tensors
+        dQ, dK, dV = flash_attention_backward_pytorch(Q, K, V, output, dO, L, ctx.is_causal)
+        return dQ, dK, dV, None
 
 
 
@@ -267,4 +271,6 @@ class FlashAttentionPytorchAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError
+        L, Q, K, V, output = ctx.saved_tensors
+        dQ, dK, dV = flash_attention_backward_pytorch(Q, K, V, output, dO, L, ctx.is_causal)
+        return dQ, dK, dV, None
