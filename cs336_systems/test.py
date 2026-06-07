@@ -24,91 +24,113 @@
 #     print(f"Saving residual: {shape=}, {dtype=}, {grad_fn=}")
 #     return t
 
+# import torch
+# from torch.utils.checkpoint import checkpoint
+# from cs336_basics.model import RotaryEmbedding, TransformerBlock
+
+# d_model, d_ff, num_heads, context_length = 2560, 10240, 16, 2048
+# device = "cuda"
+
+# torch.cuda.init()
+# _ = torch.empty((), device=device)
+
+# raw_block = TransformerBlock(
+#     d_model=d_model,
+#     d_ff=d_ff,
+#     num_heads=num_heads,
+#     positional_encoder=RotaryEmbedding(
+#         dim=d_model // num_heads,
+#         context_length=context_length,
+#     ),
+# ).to(device)
+
+# block = torch.compile(raw_block, fullgraph=True)
+
+# x = torch.randn(
+#     (4, context_length, d_model),
+#     device=device,
+#     requires_grad=True,
+# )
+
+# # warmup：让 torch.compile / CUDA / Triton 初始化发生在 checkpoint 外面
+# x_warmup = torch.randn_like(x, requires_grad=True)
+# y_warmup = block(x_warmup)
+# y_warmup.sum().backward()
+
+# raw_block.zero_grad(set_to_none=True)
+# x.grad = None
+# torch.cuda.synchronize()
+
+# total_size_bytes = 0
+
+# # 更稳妥地跳过参数和参数 view
+# param_storage_ptrs = {
+#     p.untyped_storage().data_ptr()
+#     for p in raw_block.parameters()
+# }
+
+# def is_param_storage(t):
+#     return t.untyped_storage().data_ptr() in param_storage_ptrs
+
+# def pack_hook(t):
+#     global total_size_bytes
+
+#     if is_param_storage(t):
+#         return t
+
+#     total_size_bytes += t.numel() * t.element_size()
+#     print(
+#         f"Saving residual: shape={t.shape}, "
+#         f"dtype={t.dtype}, device={t.device}, grad_fn={t.grad_fn}"
+#     )
+#     return t
+
+# def unpack_hook(t):
+#     print(
+#         f"Loading residual: shape={t.shape}, "
+#         f"dtype={t.dtype}, device={t.device}, grad_fn={t.grad_fn}"
+#     )
+#     return t
+
+# def two_blocks(x):
+#     x = block(x)
+#     x = block(x)
+#     return x
+
+# def four_blocks_checkpoint(x):
+#     x = checkpoint(two_blocks, x, use_reentrant=False)
+#     x = checkpoint(two_blocks, x, use_reentrant=False)
+#     return x
+
+# with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+#     y = four_blocks_checkpoint(x)
+#     # 如果只想统计 checkpointed forward 保存了多少，可以不 backward
+#     # 如果想观察 checkpoint backward 重算，就取消下一行注释：
+#     # y.sum().backward()
+
+# print(
+#     f"Total size of saved tensors during checkpointed forward: "
+#     f"{total_size_bytes / (1024**2):.2f} MiB"
+# )
+
+
+import os
 import torch
-from torch.utils.checkpoint import checkpoint
-from cs336_basics.model import RotaryEmbedding, TransformerBlock
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-d_model, d_ff, num_heads, context_length = 2560, 10240, 16, 2048
-device = "cuda"
+def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-torch.cuda.init()
-_ = torch.empty((), device=device)
+def distributed_demo(rank, world_size):
+    setup(rank, world_size)
+    data = torch.randint(0, 10, (3,))
+    print(f"rank {rank} data (before all-reduce): {data}")
+    dist.all_reduce(data, async_op=False)
+    print(f"rank {rank} data (after all-reduce): {data}")
 
-raw_block = TransformerBlock(
-    d_model=d_model,
-    d_ff=d_ff,
-    num_heads=num_heads,
-    positional_encoder=RotaryEmbedding(
-        dim=d_model // num_heads,
-        context_length=context_length,
-    ),
-).to(device)
-
-block = torch.compile(raw_block, fullgraph=True)
-
-x = torch.randn(
-    (4, context_length, d_model),
-    device=device,
-    requires_grad=True,
-)
-
-# warmup：让 torch.compile / CUDA / Triton 初始化发生在 checkpoint 外面
-x_warmup = torch.randn_like(x, requires_grad=True)
-y_warmup = block(x_warmup)
-y_warmup.sum().backward()
-
-raw_block.zero_grad(set_to_none=True)
-x.grad = None
-torch.cuda.synchronize()
-
-total_size_bytes = 0
-
-# 更稳妥地跳过参数和参数 view
-param_storage_ptrs = {
-    p.untyped_storage().data_ptr()
-    for p in raw_block.parameters()
-}
-
-def is_param_storage(t):
-    return t.untyped_storage().data_ptr() in param_storage_ptrs
-
-def pack_hook(t):
-    global total_size_bytes
-
-    if is_param_storage(t):
-        return t
-
-    total_size_bytes += t.numel() * t.element_size()
-    print(
-        f"Saving residual: shape={t.shape}, "
-        f"dtype={t.dtype}, device={t.device}, grad_fn={t.grad_fn}"
-    )
-    return t
-
-def unpack_hook(t):
-    print(
-        f"Loading residual: shape={t.shape}, "
-        f"dtype={t.dtype}, device={t.device}, grad_fn={t.grad_fn}"
-    )
-    return t
-
-def two_blocks(x):
-    x = block(x)
-    x = block(x)
-    return x
-
-def four_blocks_checkpoint(x):
-    x = checkpoint(two_blocks, x, use_reentrant=False)
-    x = checkpoint(two_blocks, x, use_reentrant=False)
-    return x
-
-with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-    y = four_blocks_checkpoint(x)
-    # 如果只想统计 checkpointed forward 保存了多少，可以不 backward
-    # 如果想观察 checkpoint backward 重算，就取消下一行注释：
-    # y.sum().backward()
-
-print(
-    f"Total size of saved tensors during checkpointed forward: "
-    f"{total_size_bytes / (1024**2):.2f} MiB"
-)
+if __name__ == "__main__":
+    world_size = 4
+    mp.spawn(fn=distributed_demo, args=(world_size, ), nprocs=world_size, join=True)
