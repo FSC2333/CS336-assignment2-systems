@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import queue
 import socket
 import statistics
 import timeit
@@ -17,7 +18,7 @@ import torch.multiprocessing as mp
 
 BYTES_PER_FLOAT32 = torch.finfo(torch.float32).bits // 8
 DEFAULT_SIZES_MIB = (1, 10, 100, 1024)
-DEFAULT_WORLD_SIZES = (2, 4, 6)
+DEFAULT_WORLD_SIZES = (2, 4)
 DEVICE_MODES = ("single", "rank")
 
 
@@ -40,12 +41,12 @@ class BenchmarkRow:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark single-node distributed all-reduce latency for float32 tensors.")
+    parser = argparse.ArgumentParser(description="Benchmark single-node multi-GPU distributed all-reduce latency for float32 tensors.")
     parser.add_argument("--sizes-mib", type=int, nargs="+", default=list(DEFAULT_SIZES_MIB), help="Float32 tensor payload sizes in MiB. Defaults to 1, 10, 100, and 1024 MiB.")
-    parser.add_argument("--world-sizes", type=int, nargs="+", default=list(DEFAULT_WORLD_SIZES), help="Process/GPU counts to benchmark.")
+    parser.add_argument("--world-sizes", type=int, nargs="+", default=list(DEFAULT_WORLD_SIZES), help="Process/GPU counts to benchmark. Defaults to 2 and 4.")
     parser.add_argument("--backend", choices=("auto", "nccl", "gloo"), default="auto", help="Use NCCL for CUDA rank mode by default, otherwise Gloo.")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto", help="Use CUDA by default when available.")
-    parser.add_argument("--device-mode", choices=DEVICE_MODES, default="single", help="single puts every rank on --cuda-device; rank maps rank i to cuda:i.")
+    parser.add_argument("--device-mode", choices=DEVICE_MODES, default="rank", help="rank maps rank i to cuda:i; single puts every rank on --cuda-device.")
     parser.add_argument("--cuda-device", type=int, default=0, help="CUDA device index used by every rank when --device-mode single.")
     parser.add_argument(
         "--cuda-visible-devices",
@@ -148,7 +149,7 @@ def setup_process_group(*, backend: str, master_addr: str, master_port: int, ran
         timeout=timedelta(seconds=timeout_s),
     )
 
-
+# 对固定大小的一个 tensor，测量多次 all_reduce 通信耗时，并返回当前 rank 测到的时间列表。
 def benchmark_one_size(
     *,
     tensor: torch.Tensor,
@@ -159,7 +160,7 @@ def benchmark_one_size(
     for _ in range(warmup_steps):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=False)
     synchronize(device)
-    dist.barrier()
+    dist.barrier() # 让所有 rank 在这里集合。只有所有 rank 都到达这一行，大家才会继续往下走。作用是保证：所有 rank 都完成 warm-up 后，再一起开始正式计时。
     synchronize(device)
 
     timings_s = []
@@ -209,6 +210,14 @@ def summarize_timings(
     )
 
 
+def benchmark_device_label(device_name: str, device_mode: str, cuda_device: int, world_size: int) -> str:
+    if device_name != "cuda":
+        return device_name
+    if device_mode == "single":
+        return f"cuda:{cuda_device}"
+    return f"cuda:0-{world_size - 1}"
+
+
 def worker(
     rank: int,
     world_size: int,
@@ -240,20 +249,21 @@ def worker(
             if rank == 0:
                 print(f"  benchmarking size={size_label(size_mib)}", flush=True)
             size_bytes = size_mib * 1024**2
-            numel = size_bytes // BYTES_PER_FLOAT32
+            numel = size_bytes // BYTES_PER_FLOAT32 # 计算需要多少个 float32 元素。float32 每个元素 4 bytes，所以 1 MiB 对应 262144 个元素。
             tensor = torch.zeros(numel, dtype=torch.float32, device=device)
-            synchronize(device)
+            synchronize(device) # 确保 tensor 创建等 CUDA 操作真的完成
 
-            local_timings_s = benchmark_one_size(tensor=tensor, device=device, warmup_steps=warmup_steps, measurement_steps=measurement_steps)
+            local_timings_s = benchmark_one_size(tensor=tensor, device=device, warmup_steps=warmup_steps, measurement_steps=measurement_steps) # 测试
             gathered_timings_s: list[list[float] | None] = [None for _ in range(world_size)]
-            dist.all_gather_object(gathered_timings_s, local_timings_s)
+            dist.all_gather_object(gathered_timings_s, local_timings_s) # 每个 rank 把自己的 local_timings_s 发出去，同时也接收其他所有 rank 的 local_timings_s。
 
             if rank == 0:
                 rank_timings_s = [timings for timings in gathered_timings_s if timings is not None]
+                row_device_name = benchmark_device_label(device_name, device_mode, cuda_device, world_size)
                 rows.append(
                     summarize_timings(
                         backend=backend,
-                        device_name=str(device),
+                        device_name=row_device_name,
                         world_size=world_size,
                         size_mib=size_mib,
                         numel=numel,
@@ -287,10 +297,15 @@ def run_world_size(
     master_addr: str,
     process_group_timeout_s: int,
 ) -> list[BenchmarkRow]:
+    
     ctx = mp.get_context("spawn")
+    # 获取 Python multiprocessing 的 "spawn" 启动方式。
+    # 这对 CUDA 很重要：spawn 会为每个子进程启动一个干净的 Python 解释器，比 fork 更适合 CUDA/NCCL，避免继承父进程里的 CUDA 状态。
     result_queue = ctx.SimpleQueue()
-    master_port = find_free_port(master_addr)
-    mp.spawn(
+    # 创建一个进程间通信队列。
+    # 子进程里的 rank 0 会把汇总后的 benchmark 结果放进这个 queue，父进程最后从这里取结果。
+    master_port = find_free_port(master_addr) # 后面创建的所有子进程都会用同一个地址：端口号，从而发现并组成同一个通信组
+    mp.spawn( # 创建多个子进程，每个子进程运行 worker 函数，传入必要的参数
         worker,
         args=(
             world_size,
@@ -306,8 +321,8 @@ def run_world_size(
             process_group_timeout_s,
             result_queue,
         ),
-        nprocs=world_size,
-        join=True,
+        nprocs=world_size, # 启动子进程的数目
+        join=True, #父进程等待所有子进程结束
     )
     return result_queue.get()
 
@@ -341,14 +356,14 @@ def main() -> None:
     validate_cuda_device(args, device_name)
     if args.device_mode == "rank":
         world_sizes = filter_world_sizes(args.world_sizes, device_name, args.strict_world_sizes)
-    else:
+    else:  # single
         world_sizes = args.world_sizes
     if not world_sizes:
         raise RuntimeError("No benchmarkable world sizes remain after filtering.")
 
     rows: list[BenchmarkRow] = []
     for world_size in world_sizes:
-        device_label = f"cuda:{args.cuda_device}" if device_name == "cuda" and args.device_mode == "single" else device_name
+        device_label = benchmark_device_label(device_name, args.device_mode, args.cuda_device, world_size)
         print(f"Running all-reduce benchmark: backend={backend} device={device_label} device_mode={args.device_mode} world_size={world_size}", flush=True)
         rows.extend(
             run_world_size(
