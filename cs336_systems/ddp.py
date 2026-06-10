@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 
 # 初始化时：让所有 rank 的模型参数一致。
 # backward 后：让所有 rank 的梯度一致。
+
 
 class DistributedDataParallel(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):
@@ -16,7 +18,7 @@ class DistributedDataParallel(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
-    def _broadcast_module_state(self) -> None: #同步模型初始状态的辅助函数。
+    def _broadcast_module_state(self) -> None:  # 同步模型初始状态的辅助函数。
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -37,9 +39,48 @@ class DistributedDataParallel(torch.nn.Module):
                 continue
 
             dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-            parameter.grad.div_(world_size) # 得到平均梯度
+            parameter.grad.div_(world_size)  # 得到平均梯度
             if parameter.grad.device.type == "cuda":
                 devices_to_synchronize.add(parameter.grad.device)
 
         for device in devices_to_synchronize:
             torch.cuda.synchronize(device)
+
+
+class FlatDistributedDataParallel(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self.module = module
+        self._broadcast_module_state()
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def _broadcast_module_state(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        for tensor in self.module.state_dict().values():
+            dist.broadcast(tensor, src=0)
+
+    def finish_gradient_synchronization(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return
+
+        grads = [parameter.grad for parameter in self.module.parameters() if parameter.grad is not None]
+        if not grads:
+            return
+
+        flat_grad = _flatten_dense_tensors(grads)
+        dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
+        flat_grad.div_(world_size)
+
+        for grad, synced_grad in zip(grads, _unflatten_dense_tensors(flat_grad, grads), strict=True):
+            grad.copy_(synced_grad)
+
+        if flat_grad.device.type == "cuda":
+            torch.cuda.synchronize(flat_grad.device)
